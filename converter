@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Conversor WEBP com GUI, progresso, log e descrições das opções.
+- Seleciona múltiplas imagens e uma pasta de destino
+- Mantém o nome original (troca só a extensão)
+- Barra de progresso, log ao vivo, botão Cancelar
+- Modo Rápido (menos iterações + effort menor)
+- Tooltips (passar o mouse) e textos de ajuda sob cada opção
+- Suporte a HEIC/HEIF (requer: pip install pillow-heif)
+
+Execute:
+    python compress_webp_gui_progress_help.py
+"""
+
+import io
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Optional, Tuple, List
+
+from PIL import Image, ImageOps
+
+# --- Suporte a HEIC/HEIF via pillow-heif ---
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()  # habilita Image.open() para .heic/.heif
+    HEIF_OK = True
+except Exception:
+    HEIF_OK = False
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+# ---------------------- Config padrão ----------------------
+VALID_EXTS = {
+    ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".gif", ".webp",
+    ".heic", ".heif"  # adicionadas
+}
+
+DEFAULTS = {
+    "target_kb": 80,     # tamanho alvo por arquivo
+    "min_quality": 45,   # limite inferior do intervalo de qualidade
+    "max_quality": 95,   # limite superior do intervalo de qualidade
+    "effort": 6,         # 0..6 (6 = melhor compressão, mais lento)
+    "min_width": 480,    # largura mínima ao reduzir
+    "min_height": 480,   # altura mínima ao reduzir
+    "downscale_step": 0.9  # fator de redução progressiva (ex.: 0.9 = -10% por passo)
+}
+
+# ---------------------- Compressão ----------------------
+def read_image(path: Path) -> Image.Image:
+    img = Image.open(path)
+    img.load()
+    # Corrige rotação de câmera quando houver EXIF Orientation (muito comum em HEIC de iPhone)
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        return img.convert("RGBA")
+    return img.convert("RGB")
+
+def encode_webp_bytes(img: Image.Image, quality: int, effort: int, lossless: bool,
+                      keep_exif_icc: bool) -> bytes:
+    bio = io.BytesIO()
+    kwargs = {
+        "format": "WEBP",
+        "quality": int(quality),
+        "method": int(effort),
+        "lossless": bool(lossless),
+        "exact": True,
+        "optimize": True
+    }
+    if keep_exif_icc and "icc_profile" in img.info:
+        kwargs["icc_profile"] = img.info["icc_profile"]
+    if keep_exif_icc and "exif" in img.info:
+        kwargs["exif"] = img.info["exif"]
+    img.save(bio, **kwargs)
+    return bio.getvalue()
+
+def scale_down(img: Image.Image, max_w: int, max_h: int) -> Image.Image:
+    w, h = img.size
+    if w <= max_w and h <= max_h:
+        return img
+    return ImageOps.contain(img, (max_w, max_h), method=Image.Resampling.LANCZOS)
+
+def binary_search_quality(img: Image.Image, target_bytes: int, q_min: int, q_max: int,
+                          effort: int, keep_exif_icc: bool) -> Tuple[bytes, int]:
+    best_data: Optional[bytes] = None
+    best_q: Optional[int] = None
+    lo, hi = q_min, q_max
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        data = encode_webp_bytes(img, mid, effort, False, keep_exif_icc)
+        size = len(data)
+        if size <= target_bytes:
+            best_data, best_q = data, mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best_data is not None:
+        return best_data, int(best_q)
+    # fallback no pior caso
+    data = encode_webp_bytes(img, q_min, effort, False, keep_exif_icc)
+    return data, int(q_min)
+
+def quality_ladder(img: Image.Image, target_bytes: int, effort: int, keep_exif_icc: bool,
+                   ladder: List[int]) -> Tuple[Optional[bytes], Optional[int]]:
+    best = None
+    best_q = None
+    for q in ladder:
+        data = encode_webp_bytes(img, q, effort, False, keep_exif_icc)
+        if len(data) <= target_bytes:
+            if best is None or q > best_q:
+                best = data
+                best_q = q
+    return best, best_q
+
+def compress_to_target(img: Image.Image,
+                       target_kb: int,
+                       min_quality: int,
+                       max_quality: int,
+                       effort: int,
+                       keep_exif_icc: bool,
+                       min_width: int,
+                       min_height: int,
+                       downscale_step: float,
+                       fast_mode: bool = False) -> Tuple[bytes, int, Tuple[int, int]]:
+    """
+    Estratégia:
+      1) Tentar atingir o alvo só ajustando qualidade (escada rápida ou binária).
+      2) Se não bater, reduzir dimensões gradualmente até os limites mínimos.
+    """
+    target_bytes = int(target_kb * 1024)
+
+    # 1) Qualidade na dimensão atual
+    if fast_mode:
+        quick_qualities = [80, 70, 60, 50]
+        quick, q_used = quality_ladder(img, target_bytes, effort, keep_exif_icc, quick_qualities)
+        if quick is not None:
+            return quick, q_used, img.size
+        data, q_used = binary_search_quality(img, target_bytes, min_quality, 85, effort, keep_exif_icc)
+        if len(data) <= target_bytes:
+            return data, q_used, img.size
+    else:
+        data, q_used = binary_search_quality(img, target_bytes, min_quality, max_quality, effort, keep_exif_icc)
+        if len(data) <= target_bytes:
+            return data, q_used, img.size
+
+    # 2) Reduzir dimensões
+    cur_img = img
+    cur_w, cur_h = cur_img.size
+
+    while True:
+        new_w = max(int(cur_w * downscale_step), min_width)
+        new_h = max(int(cur_h * downscale_step), min_height)
+
+        if (new_w == cur_w and new_h == cur_h) or (new_w == min_width and new_h == min_height):
+            cur_img = scale_down(cur_img, new_w, new_h)
+            if fast_mode:
+                quick, q_used = quality_ladder(cur_img, target_bytes, effort, keep_exif_icc, [80, 70, 60, 50, 40])
+                if quick is not None:
+                    return quick, q_used, cur_img.size
+                data, q_used = binary_search_quality(cur_img, target_bytes, min_quality, 85, effort, keep_exif_icc)
+            else:
+                data, q_used = binary_search_quality(cur_img, target_bytes, min_quality, max_quality, effort, keep_exif_icc)
+            return data, q_used, cur_img.size
+
+        cur_img = scale_down(cur_img, new_w, new_h)
+        cur_w, cur_h = cur_img.size
+
+        if fast_mode:
+            quick, q_used = quality_ladder(cur_img, target_bytes, effort, keep_exif_icc, [80, 70, 60, 50])
+            if quick is not None:
+                return quick, q_used, cur_img.size
+            data, q_used = binary_search_quality(cur_img, target_bytes, min_quality, 85, effort, keep_exif_icc)
+        else:
+            data, q_used = binary_search_quality(cur_img, target_bytes, min_quality, max_quality, effort, keep_exif_icc)
+
+        if len(data) <= target_bytes:
+            return data, q_used, cur_img.size
+
+# ---------------------- Arquivos ----------------------
+def should_process(path: Path) -> bool:
+    return path.suffix.lower() in VALID_EXTS
+
+def unique_out_path(dest_dir: Path, stem: str, ext: str = ".webp") -> Path:
+    candidate = dest_dir / f"{stem}{ext}"
+    if not candidate.exists():
+        return candidate
+    i = 1
+    while True:
+        cand = dest_dir / f"{stem}-{i}{ext}"
+        if not cand.exists():
+            return cand
+        i += 1
+
+# ---------------------- Worker ----------------------
+def process_one_file(src: Path,
+                     dest_dir: Path,
+                     cfg: dict,
+                     fast_mode: bool,
+                     keep_exif_icc: bool,
+                     cancel_evt: threading.Event,
+                     log_q: "queue.Queue[str]") -> None:
+    if cancel_evt.is_set():
+        return
+    if not should_process(src):
+        log_q.put(f"[pular] Extensão não suportada: {src.name}")
+        return
+
+    # Aviso amigável se tentar HEIC/HEIF sem plugin
+    if src.suffix.lower() in {".heic", ".heif"} and not HEIF_OK:
+        log_q.put("[erro] Para abrir HEIC/HEIF, instale: pip install pillow-heif")
+        return
+
+    log_q.put(f"[ler] {src.name}")
+    try:
+        img = read_image(src)
+    except Exception as e:
+        log_q.put(f"[erro] Não foi possível abrir '{src}': {e}")
+        return
+
+    try:
+        effort = cfg["effort"]
+        if fast_mode:
+            effort = min(effort, 4)  # reduzir esforço no modo rápido
+
+        data, q_used, (w, h) = compress_to_target(
+            img=img,
+            target_kb=cfg["target_kb"],
+            min_quality=cfg["min_quality"],
+            max_quality=cfg["max_quality"],
+            effort=effort,
+            keep_exif_icc=keep_exif_icc,
+            min_width=cfg["min_width"],
+            min_height=cfg["min_height"],
+            downscale_step=cfg["downscale_step"],
+            fast_mode=fast_mode
+        )
+
+        out_path = unique_out_path(dest_dir, src.stem, ".webp")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "wb") as f:
+            f.write(data)
+        size_kb = len(data) / 1024
+        log_q.put(f"[ok] {src.name} → {out_path.name} | {w}x{h}px | Q={q_used} | {size_kb:.1f} KB")
+    except Exception as e:
+        log_q.put(f"[erro] Falha ao processar '{src.name}': {e}")
+
+# ---------------------- Tooltips ----------------------
+class Tooltip:
+    """Tooltip simples para widgets Tkinter."""
+    def __init__(self, widget, text: str, wrap=60):
+        self.widget = widget
+        self.text = text
+        self.wrap = wrap
+        self.tipwindow = None
+        widget.bind("<Enter>", self.show)
+        widget.bind("<Leave>", self.hide)
+
+    def show(self, _event=None):
+        if self.tipwindow or not self.text:
+            return
+        x, y, cx, cy = self.widget.bbox("insert") if self.widget.winfo_exists() else (0, 0, 0, 0)
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + 20
+        self.tipwindow = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            tw, text=self.text, justify="left",
+            relief="solid", borderwidth=1,
+            background="#ffffe0", padx=6, pady=4, wraplength=self.wrap*6
+        )
+        label.pack(ipadx=1)
+
+    def hide(self, _event=None):
+        if self.tipwindow:
+            self.tipwindow.destroy()
+            self.tipwindow = None
+
+# ---------------------- GUI ----------------------
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Conversor WEBP (progresso + descrições)")
+        self.geometry("900x620")
+
+        self.files: List[Path] = []
+        self.dest_dir: Optional[Path] = None
+
+        # Vars
+        self.var_target = tk.IntVar(value=DEFAULTS["target_kb"])
+        self.var_min_q = tk.IntVar(value=DEFAULTS["min_quality"])
+        self.var_max_q = tk.IntVar(value=DEFAULTS["max_quality"])
+        self.var_effort = tk.IntVar(value=DEFAULTS["effort"])
+        self.var_min_w = tk.IntVar(value=DEFAULTS["min_width"])
+        self.var_min_h = tk.IntVar(value=DEFAULTS["min_height"])
+        self.var_downscale = tk.DoubleVar(value=DEFAULTS["downscale_step"])
+        self.var_fast = tk.BooleanVar(value=True)
+        self.var_keep_exif = tk.BooleanVar(value=False)
+
+        self.cancel_evt = threading.Event()
+        self.log_q: "queue.Queue[str]" = queue.Queue()
+
+        self._build_ui()
+        self.after(100, self._drain_log_queue)
+
+    def _help_label(self, parent, text):
+        lbl = tk.Label(parent, text=text, fg="#555", anchor="w", justify="left", wraplength=820)
+        lbl.pack(fill="x", padx=2)
+        return lbl
+
+    def _labeled_entry(self, parent, label_text, var, width, tooltip):
+        frm = ttk.Frame(parent); frm.pack(fill="x", pady=2)
+        lbl = ttk.Label(frm, text=label_text)
+        lbl.pack(side="left")
+        ent = ttk.Entry(frm, textvariable=var, width=width)
+        ent.pack(side="left", padx=6)
+        Tooltip(lbl, tooltip)
+        Tooltip(ent, tooltip)
+        return ent
+
+    def _build_ui(self):
+        pad = {"padx": 10, "pady": 6}
+
+        # Seleção
+        frm_top = ttk.Frame(self); frm_top.pack(fill="x", **pad)
+        ttk.Button(frm_top, text="Selecionar Imagens…", command=self.pick_images).pack(side="left")
+        ttk.Button(frm_top, text="Selecionar Pasta de Destino…", command=self.pick_dest).pack(side="left", padx=6)
+        self.lbl_files = ttk.Label(frm_top, text="0 imagens selecionadas"); self.lbl_files.pack(side="left", padx=12)
+        self.lbl_dest = ttk.Label(frm_top, text="Destino: —"); self.lbl_dest.pack(side="left")
+
+        # Opções
+        frm_opts = ttk.LabelFrame(self, text="Opções de compressão"); frm_opts.pack(fill="x", **pad)
+
+        # Linha 1 — Alvo/Qualidades/Effort
+        self._labeled_entry(
+            frm_opts, "Alvo (KB):", self.var_target, 7,
+            "Tamanho máximo desejado para cada arquivo final, em kilobytes. Ex.: 80 = ~80 KB por imagem."
+        )
+        self._help_label(frm_opts, "Define o teto de tamanho do arquivo .webp gerado por imagem.")
+
+        self._labeled_entry(
+            frm_opts, "Qualidade mínima:", self.var_min_q, 7,
+            "Limite inferior do intervalo de qualidade WebP. Quanto menor, mais compressão (e potencial perda visual)."
+        )
+        self._help_label(frm_opts, "Use 40–55 para cenários agressivos. Padrão 45.")
+
+        self._labeled_entry(
+            frm_opts, "Qualidade máxima:", self.var_max_q, 7,
+            "Limite superior do intervalo de qualidade WebP. Tentamos manter a maior qualidade possível ≤ alvo."
+        )
+        self._help_label(frm_opts, "Valores altos aumentam a chance de ficar acima do alvo (e exigir redução de dimensão).")
+
+        self._labeled_entry(
+            frm_opts, "Effort (0–6):", self.var_effort, 7,
+            "Nível de esforço do encoder WebP. 0 = mais rápido, 6 = mais lento/melhor compressão."
+        )
+        self._help_label(frm_opts, "No Modo Rápido limitamos a 4 para acelerar. Fora do modo rápido, 6 dá melhor taxa/tempo.")
+
+        # Linha 2 — Dimensões mínimas / Passo
+        self._labeled_entry(
+            frm_opts, "Largura mínima:", self.var_min_w, 7,
+            "Largura mínima permitida ao reduzir dimensões. Nunca reduzimos abaixo deste valor."
+        )
+        self._help_label(frm_opts, "Protege a nitidez para não ficar pequeno demais.")
+
+        self._labeled_entry(
+            frm_opts, "Altura mínima:", self.var_min_h, 7,
+            "Altura mínima permitida ao reduzir dimensões. Nunca reduzimos abaixo deste valor."
+        )
+        self._help_label(frm_opts, "Combine com Largura mínima para manter legibilidade.")
+
+        self._labeled_entry(
+            frm_opts, "Passo de redução (0.5–0.95):", self.var_downscale, 7,
+            "Fator de redução progressiva por iteração quando precisa diminuir dimensões. 0.9 = −10% por passo."
+        )
+        self._help_label(frm_opts, "Quanto menor o passo, mais rápido chega no alvo reduzindo dimensões (perde tamanho mais rápido).")
+
+        # Checkboxes
+        frm_checks = ttk.Frame(frm_opts); frm_checks.pack(fill="x", pady=4)
+        cb_fast = ttk.Checkbutton(frm_checks, text="Modo Rápido", variable=self.var_fast)
+        cb_fast.pack(side="left", padx=(0, 12))
+        Tooltip(cb_fast,
+                "Ativa estratégia mais ágil: tenta qualidades 80/70/60/50 antes da busca binária e reduz effort.\n"
+                "Útil para lotes grandes e quando a qualidade extrema não é crítica.")
+
+        cb_exif = ttk.Checkbutton(frm_checks, text="Manter EXIF/ICC", variable=self.var_keep_exif)
+        cb_exif.pack(side="left")
+        Tooltip(cb_exif,
+                "Preserva metadados (EXIF/ICC) quando disponíveis. Aumenta o tamanho final.\n"
+                "Desmarcado por padrão para melhor compressão.")
+
+        self._help_label(frm_opts,
+            "Resumo: definimos primeiro a qualidade ótima para caber no alvo; se não for suficiente, reduzimos dimensões "
+            "em passos até atingir o tamanho desejado sem ultrapassar os limites mínimos.")
+
+        # Progresso + Ações
+        frm_prog = ttk.Frame(self); frm_prog.pack(fill="x", **pad)
+        self.pbar = ttk.Progressbar(frm_prog, orient="horizontal", mode="determinate")
+        self.pbar.pack(fill="x", expand=True, side="left")
+        self.lbl_prog = ttk.Label(frm_prog, text="Aguardando…", width=24); self.lbl_prog.pack(side="left", padx=8)
+
+        frm_buttons = ttk.Frame(self); frm_buttons.pack(fill="x", **pad)
+        self.btn_start = ttk.Button(frm_buttons, text="Iniciar", command=self.start); self.btn_start.pack(side="left")
+        self.btn_cancel = ttk.Button(frm_buttons, text="Cancelar", command=self.cancel, state="disabled"); self.btn_cancel.pack(side="left", padx=6)
+        ttk.Button(frm_buttons, text="Limpar Log", command=self.clear_log).pack(side="left", padx=6)
+        ttk.Button(frm_buttons, text="Ajuda", command=self.show_help).pack(side="left", padx=6)
+
+        # Log
+        frm_log = ttk.LabelFrame(self, text="Log"); frm_log.pack(fill="both", expand=True, **pad)
+        self.txt = tk.Text(frm_log, height=12, wrap="word")
+        self.txt.pack(fill="both", expand=True, side="left")
+        sb = ttk.Scrollbar(frm_log, orient="vertical", command=self.txt.yview)
+        sb.pack(side="right", fill="y")
+        self.txt.configure(yscrollcommand=sb.set)
+
+    def show_help(self):
+        message = (
+            "Descrição dos parâmetros:\n\n"
+            "• Alvo (KB): tamanho máximo por arquivo final (ex.: 80 = ~80 KB).\n"
+            "• Qualidade mínima/máxima: limites do intervalo de qualidade WEBP.\n"
+            "  Ajustamos dinamicamente para chegar o mais perto possível do alvo.\n"
+            "• Effort (0–6): trade-off entre velocidade e compressão (6 = melhor compressão, mais lento).\n"
+            "• Largura/Altura mínima: limites ao reduzir dimensões para não perder legibilidade/nitidez.\n"
+            "• Passo de redução: fator por iteração ao reduzir dimensões (0.9 = -10% cada passo).\n"
+            "• Modo Rápido: tenta qualidades pré-definidas (80/70/60/50), effort menor e binária mais curta.\n"
+            "• Manter EXIF/ICC: preserva metadados quando disponíveis (pode aumentar o tamanho final).\n\n"
+            "Dicas:\n"
+            "• Para máxima velocidade, use Modo Rápido e Effort ≤ 4.\n"
+            "• Se o alvo for muito baixo, talvez precise reduzir dimensões (ajuste Passo e mínimos).\n"
+            "• Para thumbnails, mínimos de 320–480px geralmente bastam.\n"
+        )
+        messagebox.showinfo("Ajuda", message)
+
+    def pick_images(self):
+        filetypes = [
+            ("Imagens", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.gif *.webp *.heic *.heif"),
+            ("Todos os arquivos", "*.*")
+        ]
+        files = filedialog.askopenfilenames(title="Selecione as imagens", filetypes=filetypes)
+        if files:
+            self.files = [Path(p) for p in files]
+            self.lbl_files.config(text=f"{len(self.files)} imagens selecionadas")
+
+    def pick_dest(self):
+        out_dir = filedialog.askdirectory(title="Selecione a pasta de destino")
+        if out_dir:
+            self.dest_dir = Path(out_dir)
+            self.lbl_dest.config(text=f"Destino: {self.dest_dir}")
+
+    def clear_log(self):
+        self.txt.delete("1.0", "end")
+
+    def start(self):
+        if not self.files:
+            messagebox.showwarning("Conversor WEBP", "Selecione as imagens.")
+            return
+        if not self.dest_dir:
+            messagebox.showwarning("Conversor WEBP", "Selecione a pasta de destino.")
+            return
+
+        # Config
+        try:
+            cfg = {
+                "target_kb": int(self.var_target.get()),
+                "min_quality": int(self.var_min_q.get()),
+                "max_quality": int(self.var_max_q.get()),
+                "effort": max(0, min(6, int(self.var_effort.get()))),
+                "min_width": int(self.var_min_w.get()),
+                "min_height": int(self.var_min_h.get()),
+                "downscale_step": float(self.var_downscale.get()),
+            }
+        except Exception as e:
+            messagebox.showerror("Conversor WEBP", f"Valores inválidos: {e}")
+            return
+
+        if not (0.5 <= cfg["downscale_step"] <= 0.95):
+            messagebox.showwarning("Conversor WEBP", "Passo de redução deve estar entre 0.5 e 0.95.")
+            return
+
+        self.cancel_evt.clear
+        self.btn_start.config(state="disabled")
+        self.btn_cancel.config(state="normal")
+        self.pbar.config(value=0, maximum=len(self.files))
+        self.lbl_prog.config(text="Processando…")
+
+        thread = threading.Thread(
+            target=self._run_worker,
+            args=(cfg, self.var_fast.get(), self.var_keep_exif.get()),
+            daemon=True,
+        )
+        thread.start()
+
+    def cancel(self):
+        self.cancel_evt.set()
+        self.lbl_prog.config(text="Cancelando…")
+
+    def _run_worker(self, cfg: dict, fast_mode: bool, keep_exif_icc: bool):
+        total = len(self.files)
+        completed = 0
+        max_workers = 4  # paralelismo leve
+        self.log_q.put(f"[info] Iniciando com {total} arquivo(s). Modo Rápido={fast_mode}")
+
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = []
+                for src in self.files:
+                    if self.cancel_evt.is_set():
+                        break
+                    futures.append(ex.submit(
+                        process_one_file, src, self.dest_dir, cfg, fast_mode, keep_exif_icc, self.cancel_evt, self.log_q
+                    ))
+                for fut in as_completed(futures):
+                    _ = fut.result() if not self.cancel_evt.is_set() else None
+                    completed += 1
+                    self._update_progress_safe(completed, total)
+                    if self.cancel_evt.is_set():
+                        break
+        finally:
+            self.after(0, self._finish_ui)
+
+    def _update_progress_safe(self, completed: int, total: int):
+        def _update():
+            self.pbar["value"] = completed
+            self.lbl_prog.config(text=f"{completed}/{total} concluído(s)")
+        self.after(0, _update)
+
+    def _finish_ui(self):
+        if self.cancel_evt.is_set():
+            self.log_q.put("[info] Operação cancelada pelo usuário.")
+        else:
+            self.log_q.put("[info] Finalizado.")
+        self.btn_start.config(state="normal")
+        self.btn_cancel.config(state="disabled")
+
+    def _drain_log_queue(self):
+        try:
+            while True:
+                msg = self.log_q.get_nowait()
+                self.txt.insert("end", msg + "\n")
+                self.txt.see("end")
+        except queue.Empty:
+            pass
+        self.after(100, self._drain_log_queue)
+
+def main():
+    global tw  # requerido pelo Tooltip em certos ambientes
+    tw = None
+    app = App()
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()
+
+
